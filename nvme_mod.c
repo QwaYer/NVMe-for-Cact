@@ -32,7 +32,26 @@ extern void     vmm_map(uint32_t* pd, uint32_t va, uint32_t pa, int flags);
 extern void     irq_spinlock_init   (irq_spinlock_t* lock);
 extern void     irq_spinlock_acquire(irq_spinlock_t* lock);
 extern void     irq_spinlock_release(irq_spinlock_t* lock);
-extern void     irq_register_handler(unsigned int irq, void (*handler)(void));
+
+/* MSI-X table entry struct (must match kernel's msi.h) */
+struct msix_table_entry {
+    uint32_t msg_addr_lo;
+    uint32_t msg_addr_hi;
+    uint32_t msg_data;
+    uint32_t vector_ctrl;
+} __attribute__((packed));
+
+extern int      msix_alloc_vector(void);
+extern void     msix_free_vector(int vec);
+extern int      msix_register_handler(int vec, void (*handler)(void));
+extern void     msix_unregister_handler(int vec);
+extern int      pci_msix_support(pci_device_t *dev);
+extern int      pci_msix_table_map(pci_device_t *dev,
+                                   volatile struct msix_table_entry **table_out,
+                                   uint32_t *table_size_out);
+extern int      pci_msix_enable(pci_device_t *dev, int vec,
+                                volatile struct msix_table_entry *table,
+                                unsigned int entry_idx);
 extern void     mutex_init  (mutex_t* m);
 extern void     mutex_lock  (mutex_t* m);
 extern void     mutex_unlock(mutex_t* m);
@@ -70,8 +89,8 @@ static int             nvme_ready;
 static int             nvme_attached;
 static int             devfs_was_registered;
 
-static uint8_t  nvme_irq_line;
 static int      nvme_irq_armed;
+static int      nvme_msix_vector;
 static uint32_t saved_pci_cmd_dw;
 
 static irq_spinlock_t nvme_lock;
@@ -89,23 +108,7 @@ static uint8_t *io_sq_mem;
 static uint8_t *io_cq_mem;
 static uint8_t *identify_buf;
 
-static void pic_mask_line(unsigned irq) {
-    if (irq >= 16) return;
-    uint16_t port = irq < 8 ? 0x21u : 0xA1u;
-    uint8_t  line = irq < 8 ? (uint8_t)irq : (uint8_t)(irq - 8);
-    uint8_t  m    = port_byte_in(port);
-    m |= (uint8_t)(1u << line);
-    port_byte_out(port, m);
-}
 
-static void pic_unmask_line(unsigned irq) {
-    if (irq >= 16) return;
-    uint16_t port = irq < 8 ? 0x21u : 0xA1u;
-    uint8_t  line = irq < 8 ? (uint8_t)irq : (uint8_t)(irq - 8);
-    uint8_t  m    = port_byte_in(port);
-    m &= (uint8_t)~(1u << line);
-    port_byte_out(port, m);
-}
 
 static void nvme_wait_ready(int expected) {
     for (int i = 0; i < 1000000; i++)
@@ -464,10 +467,11 @@ static void nvme_detach(void) {
         nvme_wait_ready(0);
     }
 
-    if (nvme_irq_armed && nvme_irq_line < 16) {
-        pic_mask_line(nvme_irq_line);
-        irq_register_handler(nvme_irq_line, NULL);
-        nvme_irq_armed = 0;
+    if (nvme_msix_vector >= 0) {
+        msix_unregister_handler(nvme_msix_vector);
+        msix_free_vector(nvme_msix_vector);
+        nvme_msix_vector = -1;
+        nvme_irq_armed   = 0;
     }
 
     if (nvme_attached)
@@ -529,15 +533,27 @@ int pci_driver_probe(pci_device_t *pdev) {
     saved_pci_cmd_dw = pci_read32(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x04);
     uint32_t cmd = saved_pci_cmd_dw;
     cmd |= 0x06u;           /* MEM | BUS_MASTER */
-    cmd |=  (1u << 10);     /* INTx Disable: we drive completion via polling
-                             * (nvme_io_poll). Leaving INTx enabled creates a
-                             * race with nvme_irq_handler advancing cq_head
-                             * while the poll loop is examining it, which causes
-                             * the second I/O to time out. */
     pci_write32(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x04, cmd);
 
-    nvme_irq_line  = pdev->irq_line;
-    nvme_irq_armed = 0;     /* poll-only: no PIC unmask, no handler install */
+    /* Enable MSI-X for interrupt-driven I/O (replaces poll-only fallback). */
+    {
+        volatile struct msix_table_entry *table = NULL;
+        uint32_t table_size = 0;
+        nvme_msix_vector = -1;
+        int cap = pci_msix_support(pdev);
+        if (cap && pci_msix_table_map(pdev, &table, &table_size) == 0 && table_size > 0) {
+            int vec = msix_alloc_vector();
+            if (vec > 0) {
+                msix_register_handler(vec, nvme_irq_handler);
+                pci_msix_enable(pdev, vec, table, 0);
+                nvme_msix_vector = vec;
+                nvme_irq_armed   = 1;
+                klog(KLOG_OK, "NVMe: MSI-X enabled");
+            }
+        }
+        if (nvme_msix_vector < 0)
+            klog(KLOG_WARN, "NVMe: MSI-X unavailable — poll-only");
+    }
 
     uint64_t cap = ndev.bar->cap;
     ndev.db_stride = 4 << ((cap >> 32) & 0xF);
@@ -584,7 +600,7 @@ int pci_driver_probe(pci_device_t *pdev) {
 
     char tmp[16]; itoa((int)ndev.max_lba, tmp);
     kprint("[NVMe] namespace max_lba="); kprint(tmp);
-    kprint(" IRQ="); kprint_hex(nvme_irq_line); kprint("\n");
+    kprint(" IRQ=MSI-X\n");
     klog(KLOG_OK, "NVMe (kmod): IRQ-driven driver attached — /dev/nvme0 registered");
     return 0;
 }
